@@ -22,13 +22,14 @@ import com.google.api.gax.batching.FlowController;
 import com.google.api.gax.batching.FlowController.FlowControlException;
 import com.google.api.gax.core.Distribution;
 import com.google.cloud.pubsub.v1.MessageDispatcher.OutstandingMessageBatch.OutstandingMessage;
-import com.google.common.collect.ArrayListMultimap;
 import com.google.common.primitives.Ints;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.SettableFuture;
 import com.google.pubsub.v1.PubsubMessage;
 import com.google.pubsub.v1.ReceivedMessage;
+
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -78,11 +79,11 @@ class MessageDispatcher {
   private final MessageWaiter messagesWaiter;
 
   // Maps ID to "total expiration time". If it takes longer than this, stop extending.
-  private final ConcurrentMap<String, Instant> pendingMessages = new ConcurrentHashMap<>();
+  private final ConcurrentMap<String, Map.Entry<String, Instant>> pendingMessages = new ConcurrentHashMap<>();
 
-  private final LinkedBlockingQueue<String> pendingAcks = new LinkedBlockingQueue<>();
-  private final LinkedBlockingQueue<String> pendingNacks = new LinkedBlockingQueue<>();
-  private final LinkedBlockingQueue<String> pendingReceipts = new LinkedBlockingQueue<>();
+  private final LinkedBlockingQueue<Map.Entry<String, String>> pendingAcks = new LinkedBlockingQueue<>();
+  private final LinkedBlockingQueue<Map.Entry<String, String>> pendingNacks = new LinkedBlockingQueue<>();
+  private final LinkedBlockingQueue<Map.Entry<String, String>> pendingReceipts = new LinkedBlockingQueue<>();
 
   // The deadline should be set before use. Here, set it to something unreasonable,
   // so we fail loudly if we mess up.
@@ -132,17 +133,19 @@ class MessageDispatcher {
   private class AckHandler implements FutureCallback<AckReply> {
     private final String ackId;
     private final int outstandingBytes;
+    private final String messageId;
     private final long receivedTimeMillis;
 
-    AckHandler(String ackId, int outstandingBytes) {
+    AckHandler(String ackId, int outstandingBytes, String messageId) {
       this.ackId = ackId;
       this.outstandingBytes = outstandingBytes;
+      this.messageId = messageId;
       receivedTimeMillis = clock.millisTime();
     }
 
-    private void onBoth(LinkedBlockingQueue<String> destination) {
+    private void onBoth(LinkedBlockingQueue<Map.Entry<String, String>> destination) {
       pendingMessages.remove(ackId);
-      destination.add(ackId);
+      destination.add(new AbstractMap.SimpleEntry<>(ackId, messageId));
       flowController.release(1, outstandingBytes);
       messagesWaiter.incrementPendingMessages(-1);
       processOutstandingBatches();
@@ -159,7 +162,7 @@ class MessageDispatcher {
 
     @Override
     public void onSuccess(AckReply reply) {
-      LinkedBlockingQueue<String> destination;
+      LinkedBlockingQueue<Map.Entry<String, String>> destination;
       switch (reply) {
         case ACK:
           destination = pendingAcks;
@@ -331,14 +334,25 @@ class MessageDispatcher {
 
     Instant totalExpiration = now().plus(maxAckExtensionPeriod);
     for (ReceivedMessage message : messages) {
-      pendingReceipts.add(message.getAckId());
-      pendingMessages.put(message.getAckId(), totalExpiration);
+      pendingReceipts.add(new AbstractMap.SimpleEntry<String, String>(message.getAckId(), message.getMessage().getMessageId()));
+      pendingMessages.put(message.getAckId(), new AbstractMap.SimpleEntry<>(message.getMessage().getMessageId(), totalExpiration));
+    }
+
+    if (logger.isLoggable(Level.FINER)) {
+      StringBuilder sb = new StringBuilder();
+      boolean isFirst = true;
+      for (ReceivedMessage message : messages) {
+        if (!isFirst) sb.append(", ");
+        else isFirst = false;
+        sb.append(message.getMessage().getMessageId());
+      }
+      logger.log(Level.FINER, "Received {0} messages {1}", new Object[] {messages.size(), sb});
     }
 
     OutstandingMessageBatch outstandingBatch = new OutstandingMessageBatch(doneCallback);
     for (ReceivedMessage message : messages) {
       AckHandler ackHandler =
-          new AckHandler(message.getAckId(), message.getMessage().getSerializedSize());
+          new AckHandler(message.getAckId(), message.getMessage().getSerializedSize(), message.getMessage().getMessageId());
       outstandingBatch.addMessage(message, ackHandler);
     }
     synchronized (outstandingMessageBatches) {
@@ -386,11 +400,13 @@ class MessageDispatcher {
           new AckReplyConsumer() {
             @Override
             public void ack() {
+//              logger.log(Level.FINER, "Got ACK on {0}", message.getMessageId());
               response.set(AckReply.ACK);
             }
 
             @Override
             public void nack() {
+//              logger.log(Level.FINER, "Got NACK on {0}", message.getMessageId());
               response.set(AckReply.NACK);
             }
           };
@@ -400,6 +416,7 @@ class MessageDispatcher {
             @Override
             public void run() {
               try {
+                logger.log(Level.FINER, "Calling receiveMessage on {0}", message.getMessageId());
                 receiver.receiveMessage(message, consumer);
               } catch (Exception e) {
                 response.setException(e);
@@ -431,22 +448,25 @@ class MessageDispatcher {
   void extendDeadlines() {
     int extendSeconds = getMessageDeadlineSeconds();
     List<PendingModifyAckDeadline> modacks = new ArrayList<>();
+    List<String> modackMessageIds = new ArrayList<>();
     PendingModifyAckDeadline modack = new PendingModifyAckDeadline(extendSeconds);
     Instant now = now();
     Instant extendTo = now.plusSeconds(extendSeconds);
 
     int count = 0;
-    Iterator<Map.Entry<String, Instant>> it = pendingMessages.entrySet().iterator();
+    Iterator<Map.Entry<String, Map.Entry<String, Instant>>> it = pendingMessages.entrySet().iterator();
     while (it.hasNext()) {
-      Map.Entry<String, Instant> entry = it.next();
+      Map.Entry<String, Map.Entry<String, Instant>> entry = it.next();
       String ackId = entry.getKey();
-      Instant totalExpiration = entry.getValue();
+      String messageId = entry.getValue().getKey();
+      Instant totalExpiration = entry.getValue().getValue();
       // TODO(pongad): PendingModifyAckDeadline is created to dance around polling pull,
       // since one modack RPC only takes one expiration.
       // Whenever we delete polling pull, we should also delete PendingModifyAckDeadline,
       // and just construct StreamingPullRequest directly.
       if (totalExpiration.isAfter(extendTo)) {
         modack.ackIds.add(ackId);
+        modackMessageIds.add(messageId);
         count++;
         continue;
       }
@@ -458,7 +478,9 @@ class MessageDispatcher {
       }
     }
     modacks.add(modack);
-    logger.log(Level.FINER, "Sending {0} modacks", count);
+    if (count > 0 && logger.isLoggable(Level.FINER)) {
+      logger.log(Level.FINER, "Sending {0} modacks to {1}s {2}", new Object[] {count, modack.deadlineExtensionSeconds, modackMessageIds});
+    }
 
     List<String> acksToSend = Collections.<String>emptyList();
     ackProcessor.sendAckOperations(acksToSend, modacks);
@@ -468,21 +490,60 @@ class MessageDispatcher {
   void processOutstandingAckOperations() {
     List<PendingModifyAckDeadline> modifyAckDeadlinesToSend = new ArrayList<>();
 
-    List<String> acksToSend = new ArrayList<>();
-    pendingAcks.drainTo(acksToSend);
-    logger.log(Level.FINER, "Sending {0} acks", acksToSend.size());
+    List<Map.Entry<String, String>> acksToSendEntries = new ArrayList<>();
+    pendingAcks.drainTo(acksToSendEntries);
+    List<String> acksToSend = new ArrayList<>(acksToSendEntries.size());
+    for (Map.Entry<String, String> entry: acksToSendEntries) {
+      acksToSend.add(entry.getKey());
+    }
+    if (acksToSendEntries.size() > 0 && logger.isLoggable(Level.FINER)) {
+      StringBuilder sb = new StringBuilder();
+      boolean isFirst = true;
+      for (Map.Entry<String, String> entry: acksToSendEntries) {
+        if (isFirst) isFirst = false;
+        else sb.append(", ");
+        sb.append(entry.getValue());
+      }
+      logger.log(Level.FINER, "Sending {0} acks {1}", new Object[]{acksToSendEntries.size(), sb});
+    }
 
     PendingModifyAckDeadline nacksToSend = new PendingModifyAckDeadline(0);
-    pendingNacks.drainTo(nacksToSend.ackIds);
-    logger.log(Level.FINER, "Sending {0} nacks", nacksToSend.ackIds.size());
+    ArrayList<Map.Entry<String, String>> nacksToSendEntries = new ArrayList<>();
+    pendingNacks.drainTo(nacksToSendEntries);
+    for (Map.Entry<String, String> entry: nacksToSendEntries) {
+      nacksToSend.ackIds.add(entry.getKey());
+    }
+    if (nacksToSendEntries.size() > 0 && logger.isLoggable(Level.FINER)) {
+      StringBuilder sb = new StringBuilder();
+      boolean isFirst = true;
+      for (Map.Entry<String, String> entry: nacksToSendEntries) {
+        if (isFirst) isFirst = false;
+        else sb.append(", ");
+        sb.append(entry.getValue());
+      }
+      logger.log(Level.FINER, "Sending {0} nacks {1}", new Object[]{nacksToSendEntries.size(), sb});
+    }
     if (!nacksToSend.ackIds.isEmpty()) {
       modifyAckDeadlinesToSend.add(nacksToSend);
     }
 
     PendingModifyAckDeadline receiptsToSend =
         new PendingModifyAckDeadline(getMessageDeadlineSeconds());
-    pendingReceipts.drainTo(receiptsToSend.ackIds);
-    logger.log(Level.FINER, "Sending {0} receipts", receiptsToSend.ackIds.size());
+    ArrayList<Map.Entry<String, String>> receiptsToSendEntries = new ArrayList<>();
+    pendingReceipts.drainTo(receiptsToSendEntries);
+    for (Map.Entry<String, String> entry: receiptsToSendEntries) {
+      receiptsToSend.ackIds.add(entry.getKey());
+    }
+    if (receiptsToSendEntries.size() > 0 && logger.isLoggable(Level.FINER)) {
+      StringBuilder sb = new StringBuilder();
+      boolean isFirst = true;
+      for (Map.Entry<String, String> entry: receiptsToSendEntries) {
+        if (isFirst) isFirst = false;
+        else sb.append(", ");
+        sb.append(entry.getValue());
+      }
+      logger.log(Level.FINER, "Sending {0} receipts extend to {1}s {2}", new Object[]{receiptsToSendEntries.size(), receiptsToSend.deadlineExtensionSeconds, sb});
+    }
     if (!receiptsToSend.ackIds.isEmpty()) {
       modifyAckDeadlinesToSend.add(receiptsToSend);
     }
